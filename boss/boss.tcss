@@ -1,0 +1,159 @@
+#layout {
+    height: 1fr;
+}
+
+#sidebar {
+    width: 30;
+    height: 1fr;
+}
+
+#team {
+    height: 1fr;
+    border: round $border-blurred;
+}
+
+#team:focus {
+    border: round $border;
+}
+
+#main {
+    width: 1fr;
+    height: 1fr;
+}
+
+#search {
+    margin: 0 0 0 0;
+}
+
+#notes {
+    height: 1fr;
+    min-height: 6;
+    border: round $border-blurred;
+}
+
+#notes:focus {
+    border: round $border;
+}
+
+#detail {
+    height: 1fr;
+    border: round $border-blurred;
+    padding: 0 1;
+}
+
+#detail:focus {
+    border: round $border;
+}
+
+#detail-meta {
+    margin-bottom: 1;
+}
+
+#detail-body {
+    margin: 0;
+    padding: 0;
+    background: transparent;
+}
+
+#detail-images {
+    height: auto;
+}
+
+#detail-images .caption {
+    margin-top: 1;
+}
+
+#detail-images .preview {
+    width: auto;
+    height: 20;
+}
+
+/* ------------------------------------------------------------ editor */
+
+#editor {
+    height: 1fr;
+    padding: 0 1;
+}
+
+#editor-title {
+    text-style: bold;
+    padding: 1 0 0 0;
+}
+
+#editor-meta {
+    height: auto;
+}
+
+#who {
+    width: 1fr;
+}
+
+#kind {
+    width: 24;
+}
+
+#editor #body {
+    height: 1fr;
+}
+
+#attachments {
+    height: auto;
+    max-height: 6;
+    border: round $border-blurred;
+}
+
+#attachments:focus {
+    border: round $border;
+}
+
+#editor-hint {
+    height: auto;
+    padding: 0 1;
+}
+
+/* ----------------------------------------------------------- dialogs */
+
+ModalScreen {
+    align: center middle;
+}
+
+.dialog {
+    width: 64;
+    height: auto;
+    max-height: 90%;
+    padding: 1 2;
+    border: thick $primary;
+    background: $surface;
+}
+
+.dialog.help {
+    width: 90;
+    height: 90%;
+}
+
+.dialog Input {
+    margin-bottom: 1;
+}
+
+.dialog-title {
+    text-style: bold;
+    margin-bottom: 1;
+}
+
+.dialog-hint {
+    color: $text-muted;
+    margin-top: 1;
+}
+
+.dialog-buttons {
+    height: auto;
+    align-horizontal: right;
+}
+
+.dialog-buttons Button {
+    margin-left: 1;
+}
+
+#form-error {
+    height: auto;
+}
