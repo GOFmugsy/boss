@@ -59,6 +59,6 @@ Done. Try:
     boss team add alice "Alice Smith"
     boss add                  # write a note in \$EDITOR (${VISUAL:-${EDITOR:-vim}}); :wq saves, :q! cancels
 
-The first screenshot asks macOS for Screen Recording permission for your terminal app
-(System Settings → Privacy & Security → Screen & System Audio Recording).
+Evidence: take screenshots as usual (⌘⇧4 / ⌘⇧5), then press  s  in boss to pick them from
+your screenshots folder, or run  boss add --latest '@alice …'.
 EOF

@@ -3,6 +3,8 @@
 from __future__ import annotations
 
 import re
+from dataclasses import dataclass
+from datetime import datetime
 from pathlib import Path
 from typing import Callable
 
@@ -12,14 +14,33 @@ from textual.binding import Binding
 from textual.containers import Horizontal, Vertical, VerticalScroll
 from textual.screen import ModalScreen, Screen
 from textual.suggester import Suggester
-from textual.widgets import Button, Footer, Input, Label, Markdown, OptionList, Select, Static, TextArea
+from rich.text import Text
+from textual.widgets import (
+    Button, Footer, Input, Label, Markdown, OptionList, Select, SelectionList, Static, TextArea,
+)
 from textual.widgets.option_list import Option
+from textual.widgets.selection_list import Selection
 
-from .capture import CaptureError, capture_region, paste_image
-from .store import KINDS, Note, Store, extract_mentions, normalize_handle
+from .desktop import DesktopError, is_image, parse_paths, paste_image, recent_images, screenshot_dirs
+from .preview import image_preview
+from .store import KINDS, Evidence, Note, Store, extract_mentions, normalize_handle
 from .vim import VimTextArea
 
-IMAGE_SUFFIXES = {".png", ".jpg", ".jpeg", ".gif", ".webp", ".heic", ".tif", ".tiff", ".bmp"}
+
+@dataclass
+class StagedEvidence:
+    """An image chosen in the editor that becomes evidence when the note is written."""
+
+    path: Path
+    move: bool = False  # True for temporary files (clipboard) that should be moved, not copied
+    caption: str = ""
+
+
+def short_when(stamp: datetime) -> str:
+    today = datetime.now(stamp.tzinfo).date()
+    if stamp.date() == today:
+        return f"Today {stamp:%H:%M}"
+    return f"{stamp:%b %d %H:%M}" if stamp.year == today.year else f"{stamp:%Y-%m-%d}"
 
 # Ex commands understood by the editor: (shortest abbreviation, full name), as in Vim.
 EX_COMMANDS = [
@@ -61,13 +82,22 @@ def parse_handles(value: str) -> list[str]:
 
 
 def clean_path(value: str) -> Path:
-    """Accept paths typed, pasted or drag-and-dropped into the terminal."""
-    value = value.strip()
-    if len(value) > 1 and value[0] == value[-1] and value[0] in "'\"":
-        value = value[1:-1]
-    if value.startswith("file://"):
-        value = value[len("file://"):]
-    return Path(value.replace("\\ ", " ")).expanduser()
+    """A single path typed, pasted or drag-and-dropped into the terminal."""
+    paths = parse_paths(value)
+    return paths[0] if paths else Path(value.strip()).expanduser()
+
+
+def check_images(paths: list[Path]) -> tuple[list[Path], list[str]]:
+    """Split paths into usable images and error messages."""
+    good, errors = [], []
+    for path in paths:
+        if not path.is_file():
+            errors.append(f"not a file: {path}")
+        elif not is_image(path):
+            errors.append(f"not an image: {path.name}")
+        else:
+            good.append(path)
+    return good, errors
 
 
 class NoteEditor(Screen[int | None]):
@@ -81,10 +111,11 @@ class NoteEditor(Screen[int | None]):
     BINDINGS = [
         Binding("ctrl+s", "save_and_close", "Save & close", priority=True),
         Binding("ctrl+c", "cancel", "Cancel", priority=True),
-        Binding("ctrl+t", "screenshot", "Screenshot", priority=True),
+        Binding("ctrl+e", "recent_screenshots", "Screenshots", priority=True),
+        Binding("ctrl+o", "attach_file", "Import file", priority=True),
+        Binding("ctrl+l", "link_existing", "Link evidence", priority=True),
         Binding("ctrl+y", "paste_image", "Paste image", priority=True),
-        Binding("ctrl+o", "attach_file", "Attach file", priority=True),
-        Binding("x,delete", "remove_attachment", "Remove", show=False),
+        Binding("x,delete", "remove_evidence", "Unlink", show=False),
     ]
 
     def __init__(
@@ -94,15 +125,17 @@ class NoteEditor(Screen[int | None]):
         *,
         handles: list[str] | None = None,
         kind: str = "note",
-        staged: list[tuple[Path, bool]] | None = None,
+        staged: list[StagedEvidence] | None = None,
+        link: list[Evidence] | None = None,
     ) -> None:
         super().__init__()
         self.store = store
         self.note = note
         self.saved_id: int | None = note.id if note else None
-        self._existing = list(note.attachments) if note else []
-        self._removed: list[int] = []
-        self._new: list[tuple[Path, bool]] = list(staged or [])  # (path, move-into-store)
+        self._linked: list[Evidence] = list(note.evidence) if note else []  # saved links
+        self._unlink: list[int] = []  # saved links to remove on write
+        self._link: list[Evidence] = list(link or [])  # library evidence to link on write
+        self._new: list[StagedEvidence] = list(staged or [])  # files to import on write
         self._team = [m.handle for m in store.members()]
         if note:
             mentioned = set(extract_mentions(note.body))
@@ -125,7 +158,7 @@ class NoteEditor(Screen[int | None]):
                     [(label, key) for key, label, _, _ in KINDS], value=kind, allow_blank=False, id="kind"
                 )
             yield VimTextArea(body, id="body", start_in_insert=self.note is None)
-            yield OptionList(id="attachments")
+            yield OptionList(id="evidence")
             yield Static(self._hint(), id="editor-hint")
         yield Footer()
 
@@ -133,12 +166,13 @@ class NoteEditor(Screen[int | None]):
         team = " ".join(f"@{h}" for h in self._team) or "(no team yet — add people from the main screen)"
         return (
             f"[b]Team:[/] {team}\n"
-            "[dim]#words become tags · :w save · :wq / :x / ZZ save & close · :q close · :q! discard · "
-            ":shot :paste :attach PATH[/]"
+            "[dim]#words become tags · :w save · :wq / :x / ZZ save & close · :q close · :q! discard\n"
+            "Evidence: ^E screenshots folder · ^O import file · ^L link from library · ^Y clipboard · "
+            "tab to the list: enter captions, x unlinks[/]"
         )
 
     def on_mount(self) -> None:
-        self._refresh_attachments()
+        self._refresh_evidence()
         self._refresh_title()
         self.query_one("#body", VimTextArea).focus()
 
@@ -159,82 +193,135 @@ class NoteEditor(Screen[int | None]):
     def _changed(self) -> None:
         self._refresh_title()
 
-    # ---------------------------------------------------------- attachments
+    # -------------------------------------------------------------- evidence
 
-    def _refresh_attachments(self) -> None:
-        options = self.query_one("#attachments", OptionList)
+    def _evidence_items(self) -> list[tuple[str, str, Path]]:
+        """(option id, label, image path) for everything that will be linked after a write."""
+        items = []
+        for e in self._linked:
+            if e.id not in self._unlink:
+                items.append((f"e:{e.id}", e.title, e.path))
+        for e in self._link:
+            items.append((f"l:{e.id}", f"{e.title}  [dim](link pending)[/]", e.path))
+        for i, staged in enumerate(self._new):
+            label = staged.caption or staged.path.name
+            items.append((f"n:{i}", f"{label}  [dim](import pending)[/]", staged.path))
+        return items
+
+    def _refresh_evidence(self) -> None:
+        options = self.query_one("#evidence", OptionList)
+        highlighted = options.highlighted
         options.clear_options()
-        items = [
-            Option(f"▣ {a.path.name}", id=f"a:{a.id}") for a in self._existing if a.id not in self._removed
-        ]
-        items += [Option(f"▣ {path.name}  [dim](unsaved)[/]", id=f"n:{i}") for i, (path, _) in enumerate(self._new)]
-        options.add_options(items)
+        items = self._evidence_items()
+        options.add_options([Option(f"▣ {label}", id=option_id) for option_id, label, _ in items])
         options.display = bool(items)
-        options.border_title = f"Attachments ({len(items)})"
+        options.border_title = f"Evidence ({len(items)})"
+        if items:
+            options.highlighted = min(highlighted or 0, len(items) - 1)
         if self.is_mounted:
             self._refresh_title()
 
-    def action_remove_attachment(self) -> None:
-        options = self.query_one("#attachments", OptionList)
+    def _highlighted_evidence(self) -> str | None:
+        options = self.query_one("#evidence", OptionList)
         if self.focused is not options or options.highlighted is None:
+            return None
+        return options.get_option_at_index(options.highlighted).id
+
+    def action_remove_evidence(self) -> None:
+        """Unlink the highlighted evidence from this note (the library keeps it)."""
+        option_id = self._highlighted_evidence()
+        if not option_id:
             return
-        option_id = options.get_option_at_index(options.highlighted).id or ""
         kind, _, value = option_id.partition(":")
-        if kind == "a":
-            self._removed.append(int(value))
+        if kind == "e":
+            self._unlink.append(int(value))
+        elif kind == "l":
+            self._link = [e for e in self._link if e.id != int(value)]
         else:
-            path, move = self._new.pop(int(value))
-            if move:
-                path.unlink(missing_ok=True)
-        self._refresh_attachments()
-        if not options.option_count:
+            staged = self._new.pop(int(value))
+            if staged.move:
+                staged.path.unlink(missing_ok=True)
+        self._refresh_evidence()
+        if not self.query_one("#evidence", OptionList).option_count:
             self.body.focus()
 
-    def _add_file(self, path: Path, move: bool) -> None:
-        self._new.append((path, move))
-        self._refresh_attachments()
-        self.body.echo(f'"{path.name}" attached (unsaved)')
+    @on(OptionList.OptionSelected, "#evidence")
+    def edit_caption(self, event: OptionList.OptionSelected) -> None:
+        kind, _, value = (event.option.id or "").partition(":")
+        if kind == "n":
+            staged = self._new[int(value)]
 
-    @work(exclusive=True, group="capture")
-    async def action_screenshot(self) -> None:
-        self.notify("Select a region of the screen…", timeout=3)
-        try:
-            path = await capture_region(self.store.new_staging_path())
-        except CaptureError as error:
-            self.notify(str(error), severity="error", timeout=8)
-            return
-        if path is None:
-            self.notify("Screenshot cancelled", severity="warning")
+            def set_caption(caption: str | None) -> None:
+                if caption is not None:
+                    staged.caption = caption.strip()
+                    self._refresh_evidence()
+
+            self.app.push_screen(
+                PromptScreen(f"Caption for {staged.path.name}", "@handle and #tag work here too", staged.caption),
+                set_caption,
+            )
         else:
-            self._add_file(path, True)
+            evidence = self.store.evidence(int(value))
+            if evidence:
+                self.app.push_screen(EvidenceForm(self.store, evidence), self._reload_linked)
 
-    @work(exclusive=True, group="capture")
+    def _reload_linked(self, changed: bool | None = None) -> None:
+        if changed:
+            self._linked = [e for e in (self.store.evidence(x.id) for x in self._linked) if e]
+            self._link = [e for e in (self.store.evidence(x.id) for x in self._link) if e]
+            self._refresh_evidence()
+
+    def stage_files(self, paths: list[Path], move: bool = False) -> None:
+        good, errors = check_images(paths)
+        for error in errors:
+            self.body.echo(f"E484: {error}", error=True)
+        if not good:
+            return
+        self._new.extend(StagedEvidence(path, move) for path in good)
+        self._refresh_evidence()
+        if not errors:
+            names = ", ".join(f'"{p.name}"' for p in good[:2]) + (f" +{len(good) - 2}" if len(good) > 2 else "")
+            self.body.echo(f"{names} added as evidence (unsaved)")
+
+    def action_recent_screenshots(self) -> None:
+        self.app.push_screen(ScreenshotPicker(self.store), lambda paths: paths and self.stage_files(paths))
+
+    def action_link_existing(self) -> None:
+        exclude = {e.id for e in self._linked if e.id not in self._unlink} | {e.id for e in self._link}
+
+        def chosen(ids: list[int] | None) -> None:
+            if ids:
+                restored = [i for i in ids if i in self._unlink]
+                self._unlink = [i for i in self._unlink if i not in restored]
+                self._link += [e for e in (self.store.evidence(i) for i in ids if i not in restored) if e]
+                self._refresh_evidence()
+                self.body.echo(f"{len(ids)} evidence item(s) linked (unsaved)")
+
+        self.app.push_screen(EvidencePicker(self.store, exclude=exclude), chosen)
+
+    @work(exclusive=True, group="clipboard")
     async def action_paste_image(self) -> None:
         try:
             path = await paste_image(self.store.new_staging_path())
-        except CaptureError as error:
+        except DesktopError as error:
             self.notify(str(error), severity="error", timeout=8)
             return
         if path is None:
-            self.notify("No image on the clipboard", severity="warning")
+            self.body.echo("No image on the clipboard (⌃⌘⇧4 copies a screenshot to it)", error=True)
         else:
-            self._add_file(path, True)
+            self.stage_files([path], move=True)
 
     def action_attach_file(self, value: str = "") -> None:
         def attach(value: str | None) -> None:
-            if not value:
-                return
-            path = clean_path(value)
-            if path.is_file():
-                self._add_file(path, False)
-            else:
-                self.body.echo(f'E484: Can\'t open file "{path}"', error=True)
+            if value:
+                self.stage_files(parse_paths(value))
 
         if value:
             attach(value)
         else:
             self.app.push_screen(
-                PromptScreen("Attach file", "Path to an image (tip: drag a file into the terminal)"), attach
+                PromptScreen("Import evidence", "Image path(s) — tip: drag files from Finder into the terminal"),
+                attach,
             )
 
     # ---------------------------------------------------------------- saving
@@ -249,7 +336,7 @@ class NoteEditor(Screen[int | None]):
     @property
     def dirty(self) -> bool:
         """Like Vim's 'modified' flag: anything changed since the last write."""
-        return self._current() != self._saved_state or bool(self._new) or bool(self._removed)
+        return self._current() != self._saved_state or bool(self._new or self._link or self._unlink)
 
     def write(self) -> bool:
         """Save the note to the database (``:w``). Returns False if there was nothing to write."""
@@ -257,26 +344,33 @@ class NoteEditor(Screen[int | None]):
         if not self.dirty and self.saved_id is not None:
             self.body.echo(self._written_message(body))  # nothing changed; don't bump "edited"
             return True
-        has_attachments = bool(self._new) or any(a.id not in self._removed for a in self._existing)
-        if not body.strip() and not has_attachments:
+        has_evidence = bool(self._new or self._link) or any(e.id not in self._unlink for e in self._linked)
+        if not body.strip() and not has_evidence:
             self.body.echo("E32: Nothing to write — the note is empty", error=True)
             return False
         note, unknown = self.store.save_note(
             body.strip("\n"), kind=kind, handles=parse_handles(who), note_id=self.saved_id
         )
-        for path, move in self._new:
+        for staged in self._new:
             try:
-                self.store.add_attachment(note.id, path, move=move)
+                evidence, more_unknown, _ = self.store.import_evidence(
+                    staged.path, caption=staged.caption, move=staged.move
+                )
             except OSError as error:
-                self.notify(f"Could not attach {path}: {error}", severity="error")
-        for attachment_id in self._removed:
-            self.store.remove_attachment(attachment_id)
+                self.notify(f"Could not import {staged.path}: {error}", severity="error")
+                continue
+            unknown += [h for h in more_unknown if h not in unknown]
+            self.store.link_evidence(note.id, evidence.id)
+        for evidence in self._link:
+            self.store.link_evidence(note.id, evidence.id)
+        for evidence_id in self._unlink:
+            self.store.unlink_evidence(note.id, evidence_id)
         self.note = self.store.note(note.id)
         self.saved_id = note.id
-        self._existing = list(self.note.attachments) if self.note else []
-        self._new, self._removed = [], []
+        self._linked = list(self.note.evidence) if self.note else []
+        self._new, self._link, self._unlink = [], [], []
         self._saved_state = (body, kind, who)
-        self._refresh_attachments()
+        self._refresh_evidence()
         message = self._written_message(body)
         if unknown:
             message += " · not on your team: " + " ".join(f"@{h}" for h in unknown)
@@ -306,11 +400,11 @@ class NoteEditor(Screen[int | None]):
         return True
 
     def close(self, discard: bool = False) -> None:
-        """Leave the editor. Unsaved screenshots are deleted when discarding."""
+        """Leave the editor. Unsaved clipboard images are deleted when discarding."""
         if discard:
-            for path, move in self._new:
-                if move:
-                    path.unlink(missing_ok=True)
+            for staged in self._new:
+                if staged.move:
+                    staged.path.unlink(missing_ok=True)
         self.dismiss(self.saved_id)
 
     def quit(self, force: bool) -> None:
@@ -325,11 +419,11 @@ class NoteEditor(Screen[int | None]):
         self.body.set_text(body)
         self.query_one("#kind", Select).value = kind
         self.query_one("#who", Input).value = who
-        for path, move in self._new:
-            if move:
-                path.unlink(missing_ok=True)
-        self._new, self._removed = [], []
-        self._refresh_attachments()
+        for staged in self._new:
+            if staged.move:
+                staged.path.unlink(missing_ok=True)
+        self._new, self._link, self._unlink = [], [], []
+        self._refresh_evidence()
         self.body.echo("Reverted to the last saved version")
 
     def action_save_and_close(self) -> None:
@@ -385,15 +479,15 @@ class NoteEditor(Screen[int | None]):
             self._app_command(command)
 
     def _read_file(self, arg: str) -> None:
-        """``:r FILE`` inserts a text file below the cursor; images are attached instead."""
+        """``:r FILE`` inserts a text file below the cursor; images are added as evidence instead."""
         if not arg:
             self.body.echo("E32: No file name", error=True)
             return
         path = clean_path(arg)
         if not path.is_file():
             self.body.echo(f'E484: Can\'t open file "{path}"', error=True)
-        elif path.suffix.lower() in IMAGE_SUFFIXES:
-            self._add_file(path, False)
+        elif is_image(path):
+            self.stage_files([path])
         else:
             text = path.read_text(errors="replace").rstrip("\n")
             row = self.body.cursor_location[0]
@@ -404,12 +498,14 @@ class NoteEditor(Screen[int | None]):
 
     def _app_command(self, command: str) -> None:
         name, _, arg = command.partition(" ")
-        if name in ("shot", "screenshot"):
-            self.action_screenshot()
+        if name in ("recent", "screenshots", "shots"):
+            self.action_recent_screenshots()
         elif name in ("paste", "pasteimg"):
             self.action_paste_image()
-        elif name == "attach":
+        elif name in ("attach", "import", "evidence"):
             self.action_attach_file(arg.strip())
+        elif name == "link":
+            self.action_link_existing()
         elif name == "kind" and arg.strip() in [key for key, *_ in KINDS]:
             self.query_one("#kind", Select).value = arg.strip()
         else:
@@ -524,25 +620,222 @@ class PromptScreen(ModalScreen[str | None]):
         self.dismiss(event.value)
 
 
+class ImagePicker(ModalScreen[list]):
+    """Pick one or more images from a list, with a live preview of the highlighted one.
+
+    space toggles a selection; enter takes the selected items (or the highlighted one).
+    """
+
+    BINDINGS = [
+        Binding("enter", "choose", "Choose", priority=True),
+        Binding("escape", "dismiss([])", "Cancel"),
+    ]
+
+    def __init__(self, title: str, items: list[tuple[object, Text, Path]], empty: str) -> None:
+        super().__init__()
+        self.picker_title = title
+        self.items = items
+        self.paths = {i: path for i, (_, _, path) in enumerate(items)}
+        self.empty = empty
+
+    def compose(self) -> ComposeResult:
+        with Vertical(classes="dialog picker" if self.items else "dialog"):
+            yield Label(self.picker_title, classes="dialog-title")
+            if not self.items:
+                yield Static(self.empty)
+            else:
+                with Horizontal(classes="picker-body"):
+                    yield SelectionList[int](
+                        *[Selection(label, i) for i, (_, label, _) in enumerate(self.items)], id="choices"
+                    )
+                    yield VerticalScroll(id="picker-preview")
+            yield Label("[b]space[/] select several  [b]enter[/] choose  [b]esc[/] cancel", classes="dialog-hint")
+
+    def on_mount(self) -> None:
+        if self.items:
+            self._preview(0)
+
+    @on(SelectionList.SelectionHighlighted)
+    def highlighted(self, event: SelectionList.SelectionHighlighted) -> None:
+        self._preview(event.selection.value)
+
+    def _preview(self, index: int) -> None:
+        pane = self.query_one("#picker-preview", VerticalScroll)
+        pane.remove_children()
+        path = self.paths[index]
+        pane.mount(Static(Text(path.name, style="bold")), image_preview(path, "picker-image"))
+
+    def action_choose(self) -> None:
+        if not self.items:
+            self.dismiss([])
+            return
+        choices = self.query_one("#choices", SelectionList)
+        indexes = list(choices.selected) or ([choices.highlighted] if choices.highlighted is not None else [])
+        self.dismiss([self.items[i][0] for i in sorted(indexes)])
+
+
+class ScreenshotPicker(ImagePicker):
+    """Recent images from the screenshots folder (macOS: where ⌘⇧4 saves)."""
+
+    def __init__(self, store: Store) -> None:
+        folders = screenshot_dirs()
+        items = []
+        for path in recent_images(folders):
+            stamp = datetime.fromtimestamp(path.stat().st_mtime).astimezone()
+            imported = store.evidence_by_source(path.resolve()) is not None
+            label = Text.assemble(
+                (f"{short_when(stamp):<13}", "dim"), ("✓ imported  " if imported else "", "green"), path.name
+            )
+            items.append((path, label, path))
+        where = ", ".join(str(f).replace(str(Path.home()), "~") for f in folders) or "(none found)"
+        super().__init__(
+            f"Import screenshots as evidence · {where}",
+            items,
+            "No images from the last 30 days in your screenshots folder.\n"
+            "Take one with ⌘⇧4 (or ⌘⇧5), or set BOSS_SCREENSHOTS_DIR to another folder.",
+        )
+
+
+class EvidencePicker(ImagePicker):
+    """Evidence already in the library (unlinked items first)."""
+
+    def __init__(self, store: Store, exclude: set[int] | None = None) -> None:
+        library = [e for e in store.evidence_list() if e.id not in (exclude or set())]
+        library.sort(key=lambda e: (bool(e.note_ids), -e.taken.timestamp()))
+        items = []
+        for e in library:
+            label = Text.assemble((f"{short_when(e.taken):<13}", "dim"), e.title)
+            people = " ".join(f"@{m.handle}" for m in e.people)
+            if people:
+                label.append(f"  {people}", style="cyan")
+            label.append(f"  {len(e.note_ids)} notes" if e.note_ids else "  unlinked", style="dim" if e.note_ids else "yellow")
+            items.append((e.id, label, e.path))
+        super().__init__("Link evidence from the library", items, "The evidence library is empty.")
+
+
+class NotePicker(ModalScreen[int | None]):
+    """Choose a note to link evidence to. Returns a note id, -1 for a new note, or None."""
+
+    BINDINGS = [Binding("escape", "dismiss(None)", "Cancel")]
+
+    def __init__(self, store: Store, exclude: set[int] | None = None, title: str = "Link to which note?") -> None:
+        super().__init__()
+        self.store = store
+        self.exclude = exclude or set()
+        self.picker_title = title
+
+    def compose(self) -> ComposeResult:
+        with Vertical(classes="dialog picker"):
+            yield Label(self.picker_title, classes="dialog-title")
+            yield Input(placeholder="filter: text  #tag  @handle  kind:win", id="note-filter")
+            yield OptionList(id="note-choices")
+            yield Label("[b]↑↓[/] move  [b]enter[/] link  [b]esc[/] cancel", classes="dialog-hint")
+
+    def on_mount(self) -> None:
+        self._fill("")
+        self.query_one("#note-filter").focus()
+
+    @on(Input.Changed, "#note-filter")
+    def filter_changed(self, event: Input.Changed) -> None:
+        self._fill(event.value)
+
+    def _fill(self, query: str) -> None:
+        options = self.query_one("#note-choices", OptionList)
+        options.clear_options()
+        options.add_option(Option(Text("+ New note with this evidence", style="green"), id="-1"))
+        for note in self.store.notes(query=query)[:200]:
+            if note.id in self.exclude:
+                continue
+            who = " ".join(f"@{m.handle}" for m in note.members)
+            label = Text.assemble((f"{short_when(note.created):<13}", "dim"), note.title[:70], (f"  {who}", "cyan"))
+            options.add_option(Option(label, id=str(note.id)))
+        options.highlighted = 1 if options.option_count > 1 and query else 0
+
+    @on(Input.Submitted, "#note-filter")
+    def submitted(self) -> None:
+        options = self.query_one("#note-choices", OptionList)
+        if options.highlighted is not None:
+            self.dismiss(int(options.get_option_at_index(options.highlighted).id or "-1"))
+
+    def on_key(self, event) -> None:
+        if event.key in ("down", "up") and self.focused is self.query_one("#note-filter"):
+            options = self.query_one("#note-choices", OptionList)
+            options.action_cursor_down() if event.key == "down" else options.action_cursor_up()
+            event.stop()
+
+    @on(OptionList.OptionSelected, "#note-choices")
+    def selected(self, event: OptionList.OptionSelected) -> None:
+        self.dismiss(int(event.option.id or "-1"))
+
+
+class EvidenceForm(ModalScreen[bool]):
+    """Caption and tag a piece of evidence; shows which notes it supports."""
+
+    BINDINGS = [Binding("escape", "dismiss(False)", "Cancel"), Binding("ctrl+s", "save", "Save", priority=True)]
+
+    def __init__(self, store: Store, evidence: Evidence) -> None:
+        super().__init__()
+        self.store = store
+        self.evidence = evidence
+
+    def compose(self) -> ComposeResult:
+        e = self.evidence
+        mentioned = set(extract_mentions(e.caption))
+        who = " ".join(f"@{m.handle}" for m in e.members if m.handle not in mentioned)
+        notes = [n for n in (self.store.note(i) for i in e.note_ids) if n]
+        with Vertical(classes="dialog evidence-form"):
+            yield Label(f"Evidence #{e.id} · {e.taken:%a %b %d %Y, %H:%M}", classes="dialog-title")
+            yield image_preview(e.path, "form-image")
+            yield Input(e.caption, placeholder="Caption — what does this show? (@handle and #tag work)", id="caption")
+            yield Input(
+                who, placeholder="@people (besides those on linked notes)", id="people",
+                suggester=HandleSuggester([m.handle for m in self.store.members()]),
+            )
+            linked = "\n".join(f"  • {short_when(n.created)}  {n.title[:60]}" for n in notes) or "  (none — press L on the main screen to link it)"
+            yield Static(f"[b]Linked notes[/]\n{linked}\n[dim]{e.source_name or e.path.name}[/]")
+            yield Label("[b]enter[/] / [b]ctrl+s[/] save   [b]esc[/] cancel", classes="dialog-hint")
+
+    def on_mount(self) -> None:
+        self.query_one("#caption").focus()
+
+    @on(Input.Submitted)
+    def action_save(self) -> None:
+        caption = self.query_one("#caption", Input).value
+        people = parse_handles(self.query_one("#people", Input).value)
+        _, unknown = self.store.update_evidence(self.evidence.id, caption=caption, handles=people)
+        if unknown:
+            self.notify("Not on your team yet: " + ", ".join(f"@{h}" for h in unknown), severity="warning")
+        self.dismiss(True)
+
+
 HELP = """\
 # boss — keyboard reference
 
 ## Main screen
 | Key | Action |
 |---|---|
-| `n` | New note (tagged to the selected person) |
-| `s` | New note from a **screenshot** (select a screen region) |
-| `p` | New note from an image on the **clipboard** |
-| `enter` / `e` | Edit the highlighted note |
-| `d` | Delete the highlighted note |
-| `o` | Open the note's screenshots in your image viewer |
+| `n` | New note (tagged to the selected person; in evidence view, linked to the highlighted evidence) |
+| `enter` / `e` | Edit the highlighted note, or caption/tag the highlighted evidence |
+| `d` | Delete the highlighted note (its evidence stays in the library) or evidence |
+| `v` | Switch between **notes** and **evidence** (for everyone or the selected person) |
+| `s` | Import from your **screenshots folder** (where ⌘⇧4 saves) |
+| `i` | Import image file(s) — drag files from Finder into the prompt |
+| `p` | Import the image on the **clipboard** (⌃⌘⇧4 copies a screenshot) |
+| `L` | **Link**: evidence → a note, or library evidence → the highlighted note |
+| `o` | Open evidence in Preview |
 | `/` | Filter: free text, `#tag`, `@handle`, `kind:win` (esc clears) |
 | `j` `k` / `g` `G` | Move down / up, top / bottom |
-| `h` `l` / `tab` | Jump between the team list and the notes |
-| `a` | Add a team member · `r` edit · `A` archive/restore |
-| `H` | Show / hide archived people |
-| `w` | Export the current view to Markdown (for reviews) |
+| `h` `l` / `tab` | Jump between the team list and the list |
+| `a` | Add a team member · `r` edit · `A` archive/restore · `H` show archived |
+| `w` | Export the current view (with evidence) to Markdown |
 | `ctrl+q` | Quit |
+
+In the **notes** view, importing (`s` `i` `p`) starts a new note with the images.
+In the **evidence** view, it adds them to the library (tagged to the selected person) —
+then press `e` to caption them and `L` to link them to notes. *Unlinked* in the team list
+collects evidence that doesn't support a note yet.
+
+boss doesn't take screenshots itself: use ⌘⇧4 / ⌘⇧5, then import.
 
 ## Note editor
 | Key | Action |
@@ -552,17 +845,19 @@ HELP = """\
 | `:q` | Close (refuses with E37 if there are unsaved changes) |
 | `:q!` `ZQ` | Close and discard unsaved changes |
 | `:e!` | Revert to the last saved version |
-| `:w FILE` / `:r FILE` | Write the note to a file / insert a file (images are attached) |
+| `:w FILE` / `:r FILE` | Write the note to a file / insert a file (images become evidence) |
+| `ctrl+e` or `:recent` | Add evidence from your screenshots folder |
+| `ctrl+o` or `:attach PATH…` | Add image file(s) as evidence |
+| `ctrl+l` or `:link` | Link evidence already in the library |
+| `ctrl+y` or `:paste` | Add the clipboard image as evidence |
+| `tab` (normal mode) | Move to people / kind / evidence list (`enter` captions, `x` unlinks) |
 | `ctrl+c` | Leave insert mode (like Vim); from other fields, cancel |
-| `ctrl+t` or `:shot` | Attach a screenshot |
-| `ctrl+y` or `:paste` | Attach the clipboard image |
-| `ctrl+o` or `:attach PATH` | Attach an image file |
-| `tab` (in normal mode) | Move to people / kind / attachments |
 
-Write `@handle` anywhere in a note to tag a person and `#topic` to add a tag.
+Evidence changes are saved with the note (`:w`). Write `@handle` anywhere in a note or
+caption to tag a person and `#topic` to add a tag.
 
 ## Vim support in the editor
-New notes start in **insert** mode; `Esc` (or `ctrl+[`) returns to **normal** mode.
+New notes start in **insert** mode; `Esc` (or `ctrl+[` / `ctrl+c`) returns to **normal** mode.
 
 * **Motions** `h j k l` `w b e W B E ge` `0 ^ $ _ |` `gg G` `{ }` `f F t T ; ,` `%` `n N` `+ -` `ctrl+d/u/f/b` — all take counts
 * **Operators** `d c y > < gu gU g~` + any motion or text object; `dd cc yy >> <<`
@@ -571,7 +866,6 @@ New notes start in **insert** mode; `Esc` (or `ctrl+[`) returns to **normal** mo
 * **Visual** `v` / `V`, then a motion or text object and `d y c > < ~ u U J p r o`
 * **Search** `/text` `?text`, then `n` / `N` (smart-case)
 * **Insert mode** `ctrl+w` delete word · `ctrl+u` delete to line start · Markdown bullets continue on Enter
-* **Ex** `:w :q :q! :wq :x :<line>` `zz zt zb`
 
 _Press esc or q to close._
 """

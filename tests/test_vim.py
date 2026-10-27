@@ -145,9 +145,9 @@ async def test_ex_commands_are_posted():
     app = VimApp("x")
     async with app.run_test() as pilot:
         area = app.query_one(VimTextArea)
-        feed(area, ":wq<cr>:shot<cr>ZZ")
+        feed(area, ":wq<cr>:recent<cr>ZZ")
         await pilot.pause()
-        assert app.commands == ["wq", "shot", "x"]
+        assert app.commands == ["wq", "recent", "x"]
 
 
 async def test_real_key_events():

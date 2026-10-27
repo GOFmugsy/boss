@@ -25,13 +25,13 @@
     margin: 0 0 0 0;
 }
 
-#notes {
+#items {
     height: 1fr;
     min-height: 6;
     border: round $border-blurred;
 }
 
-#notes:focus {
+#items:focus {
     border: round $border;
 }
 
@@ -96,13 +96,13 @@
     height: 1fr;
 }
 
-#attachments {
+#evidence {
     height: auto;
     max-height: 6;
     border: round $border-blurred;
 }
 
-#attachments:focus {
+#evidence:focus {
     border: round $border;
 }
 
@@ -156,4 +156,46 @@ ModalScreen {
 
 #form-error {
     height: auto;
+}
+
+/* ----------------------------------------------------------- pickers */
+
+.dialog.picker {
+    width: 90%;
+    height: 80%;
+}
+
+.picker-body {
+    height: 1fr;
+}
+
+#choices {
+    width: 1fr;
+    height: 1fr;
+}
+
+#picker-preview {
+    width: 1fr;
+    height: 1fr;
+    padding: 0 1;
+}
+
+#picker-preview .picker-image {
+    width: auto;
+    height: auto;
+    max-height: 100%;
+}
+
+#note-choices {
+    height: 1fr;
+}
+
+.dialog.evidence-form {
+    width: 80%;
+}
+
+.evidence-form .form-image {
+    width: auto;
+    height: 14;
+    margin-bottom: 1;
 }
