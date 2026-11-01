@@ -29,6 +29,10 @@ KIND_LABELS = {key: label for key, label, _, _ in KINDS}
 KIND_STYLES = {key: style for key, _, style, _ in KINDS}
 KIND_MARKERS = {key: marker for key, _, _, marker in KINDS}
 
+# Special tag: a note (or evidence) tagged #hide stays in boss but is left out of summaries
+# such as Markdown exports.
+HIDE_TAG = "hide"
+
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS members (
     id INTEGER PRIMARY KEY,
@@ -171,6 +175,17 @@ class Evidence:
     tags: list[str] = field(default_factory=list)
     note_ids: list[int] = field(default_factory=list)
     note_members: list[Member] = field(default_factory=list)  # people on the linked notes
+    hidden_note_ids: list[int] = field(default_factory=list)  # linked notes tagged #hide
+
+    @property
+    def hidden(self) -> bool:
+        """Tagged #hide itself."""
+        return HIDE_TAG in self.tags
+
+    @property
+    def hidden_from_summaries(self) -> bool:
+        """Tagged #hide, or only supports notes that are tagged #hide."""
+        return self.hidden or bool(self.note_ids) and set(self.note_ids) <= set(self.hidden_note_ids)
 
     @property
     def taken(self) -> datetime:
@@ -206,6 +221,11 @@ class Note:
     @property
     def created(self) -> datetime:
         return datetime.fromisoformat(self.created_at)
+
+    @property
+    def hidden(self) -> bool:
+        """Tagged #hide: kept in boss, left out of summaries and exports."""
+        return HIDE_TAG in self.tags
 
     @property
     def title(self) -> str:
@@ -634,10 +654,23 @@ class Store:
         links = self.conn.execute(
             f"SELECT evidence_id, note_id FROM note_evidence WHERE evidence_id IN ({marks}) ORDER BY note_id", ids
         ).fetchall()
-        note_people = self._members_for("note_members", "note_id", list({row["note_id"] for row in links}))
+        note_ids = list({row["note_id"] for row in links})
+        note_people = self._members_for("note_members", "note_id", note_ids)
+        hidden_notes = set()
+        if note_ids:
+            note_marks = ",".join("?" * len(note_ids))
+            hidden_notes = {
+                row[0]
+                for row in self.conn.execute(
+                    f"SELECT note_id FROM note_tags WHERE tag = ? AND note_id IN ({note_marks})",
+                    [HIDE_TAG, *note_ids],
+                )
+            }
         for row in links:
             item = items[row["evidence_id"]]
             item.note_ids.append(row["note_id"])
+            if row["note_id"] in hidden_notes:
+                item.hidden_note_ids.append(row["note_id"])
             for member in note_people.get(row["note_id"], []):
                 if all(m.id != member.id for m in item.note_members):
                     item.note_members.append(member)

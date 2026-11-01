@@ -135,7 +135,8 @@ _boss() {
             '(-o --output)'{-o,--output}'[file to write]:file:_files -g "*.md(-.)"' \
             '(-f --filter)'{-f,--filter}'[text, #tag, @handle, kind:win]:filter:' \
             '--since[only notes since]:date (YYYY-MM-DD):' \
-            '--until[only notes before]:date (YYYY-MM-DD):' && ret=0
+            '--until[only notes before]:date (YYYY-MM-DD):' \
+            '--include-hidden[include notes tagged #hide]' && ret=0
           ;;
         team)
           _arguments \

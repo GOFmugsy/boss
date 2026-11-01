@@ -166,7 +166,7 @@ class NoteEditor(Screen[int | None]):
         team = " ".join(f"@{h}" for h in self._team) or "(no team yet — add people from the main screen)"
         return (
             f"[b]Team:[/] {team}\n"
-            "[dim]#words become tags · :w save · :wq / :x / ZZ save & close · :q close · :q! discard\n"
+            "[dim]#words become tags (#hide keeps a note out of exports) · :w save · :wq / :x / ZZ save & close · :q close · :q! discard\n"
             "Evidence: ^E screenshots folder · ^O import file · ^L link from library · ^Y clipboard · "
             "tab to the list: enter captions, x unlinks[/]"
         )
@@ -855,6 +855,11 @@ boss doesn't take screenshots itself: use ⌘⇧4 / ⌘⇧5, then import.
 
 Evidence changes are saved with the note (`:w`). Write `@handle` anywhere in a note or
 caption to tag a person and `#topic` to add a tag.
+
+**`#hide`** is special: a note (or evidence caption) tagged `#hide` stays in boss, marked
+⊘, but is left out of summaries — Markdown exports and their counts. Evidence that only
+supports hidden notes is left out too. Remove the tag to include it again; filter with
+`/#hide` to see everything hidden.
 
 ## Vim support in the editor
 New notes start in **insert** mode; `Esc` (or `ctrl+[` / `ctrl+c`) returns to **normal** mode.

@@ -22,11 +22,12 @@ from .screens import (
     ConfirmScreen, EvidenceForm, EvidencePicker, HelpScreen, MemberForm, NoteEditor, NotePicker,
     PromptScreen, ScreenshotPicker, StagedEvidence, check_images, short_when,
 )
-from .store import KIND_LABELS, KIND_MARKERS, KIND_STYLES, Evidence, Member, Note, Store
+from .store import HIDE_TAG, KIND_LABELS, KIND_MARKERS, KIND_STYLES, Evidence, Member, Note, Store
 
 ALL, UNASSIGNED, EVIDENCE, UNLINKED = "all", "unassigned", "evidence", "unlinked"
 NOTES_MODE, EVIDENCE_MODE = "notes", "evidence"
 MAX_PREVIEWS = 3
+HIDDEN_MARK = "⊘ "
 
 
 def when(note: Note) -> str:
@@ -221,6 +222,8 @@ class MainScreen(Screen):
             self._notes = {note.id: note for note in notes}
             for note in notes:
                 title = Text(note.title, no_wrap=True, overflow="ellipsis")
+                if note.hidden:
+                    title = Text.assemble((HIDDEN_MARK, "magenta"), (note.title, "dim"), no_wrap=True, overflow="ellipsis")
                 tags = " ".join(f"#{t}" for t in note.tags)
                 if tags and tags not in note.title:
                     title.append(f"  {tags}", style="dim")
@@ -232,8 +235,10 @@ class MainScreen(Screen):
             self._evidence = {e.id: e for e in items}
             for e in items:
                 title = Text(e.title, no_wrap=True, overflow="ellipsis")
-                if not e.caption:
+                if not e.caption or e.hidden_from_summaries:
                     title.stylize("dim")
+                if e.hidden_from_summaries:
+                    title = Text.assemble((HIDDEN_MARK, "magenta"), title, no_wrap=True, overflow="ellipsis")
                 count = Text(str(len(e.note_ids)), style="cyan") if e.note_ids else Text("—", style="yellow")
                 table.add_row(short_when(e.taken), handles_text(e.people), title, count, key=str(e.id))
             ids = list(self._evidence)
@@ -307,6 +312,8 @@ class MainScreen(Screen):
             line.append("  " + " ".join(f"#{t}" for t in note.tags), style="cyan")
         if note.updated_at != note.created_at:
             line.append(f"\nedited {datetime.fromisoformat(note.updated_at):%b %d %H:%M}", style="dim")
+        if note.hidden:
+            line.append(f"\n{HIDDEN_MARK}hidden from summaries and exports (#{HIDE_TAG})", style="magenta")
         meta.update(line)
         body.update(note.body)
         widgets = []
@@ -326,6 +333,9 @@ class MainScreen(Screen):
         if evidence.tags:
             line.append("  " + " ".join(f"#{t}" for t in evidence.tags), style="cyan")
         line.append(f"\n{evidence.source_name or evidence.path.name}", style="dim")
+        if evidence.hidden_from_summaries:
+            why = f"tagged #{HIDE_TAG}" if evidence.hidden else f"only supports notes tagged #{HIDE_TAG}"
+            line.append(f"\n{HIDDEN_MARK}hidden from summaries and exports ({why})", style="magenta")
         meta.update(line)
         notes = [n for n in (self.store.note(i) for i in evidence.note_ids) if n]
         caption = evidence.caption or "_No caption — press **e** to describe what this shows._"
@@ -589,8 +599,9 @@ class MainScreen(Screen):
         if member:
             linked = {e.id for n in notes for e in n.evidence}
             extra = [e for e in self.store.evidence_list(member.id) if e.id not in linked]
-        if not notes and not extra:
-            self.notify("Nothing to export", severity="warning")
+        hidden = sum(note.hidden for note in notes)
+        if len(notes) == hidden and not any(not e.hidden_from_summaries for e in extra):
+            self.notify("Nothing to export" + (f" ({hidden} hidden with #hide)" if hidden else ""), severity="warning")
             return
         slug = member.handle if member else self.view
         self.store.exports_dir.mkdir(parents=True, exist_ok=True)
@@ -598,7 +609,8 @@ class MainScreen(Screen):
         name = member.label if member else ("Unassigned notes" if self.view == UNASSIGNED else "All notes")
         title = f"Notes: {name}" + (f" (filter: {self.query_text})" if self.query_text else "")
         path.write_text(notes_to_markdown(title, notes, path.parent, extra_evidence=extra))
-        self.notify(f"Exported {len(notes)} notes to {path}", timeout=10)
+        left_out = f" ({hidden} tagged #hide left out)" if hidden else ""
+        self.notify(f"Exported {len(notes) - hidden} notes{left_out} to {path}", timeout=10)
 
     # team
 

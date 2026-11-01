@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import os
 from collections import Counter
+from dataclasses import replace
 from datetime import datetime
 from pathlib import Path
 
@@ -25,19 +26,38 @@ def _evidence_block(evidence: Evidence, out_dir: Path | None) -> list[str]:
     return lines
 
 
+def for_summary(
+    notes: list[Note], extra_evidence: list[Evidence] | None = None
+) -> tuple[list[Note], list[Evidence], int]:
+    """Drop everything tagged #hide. Returns ``(notes, extra_evidence, hidden_note_count)``.
+
+    Evidence is dropped when it is tagged #hide itself or only supports hidden notes.
+    """
+    shown = [
+        replace(note, evidence=[e for e in note.evidence if not e.hidden]) for note in notes if not note.hidden
+    ]
+    extra = [e for e in extra_evidence or [] if not e.hidden_from_summaries]
+    return shown, extra, len(notes) - len(shown)
+
+
 def notes_to_markdown(
     title: str,
     notes: list[Note],
     out_dir: Path | None = None,
     *,
     extra_evidence: list[Evidence] | None = None,
+    include_hidden: bool = False,
 ) -> str:
     """Render ``notes`` oldest first, grouped by month, each followed by its evidence.
 
     ``extra_evidence`` (e.g. screenshots tagged to a person but not linked to any of these
-    notes) is listed at the end.
+    notes) is listed at the end. Notes and evidence tagged #hide are left out unless
+    ``include_hidden`` is set.
     """
-    extra_evidence = extra_evidence or []
+    if include_hidden:
+        extra_evidence = extra_evidence or []
+    else:
+        notes, extra_evidence, _ = for_summary(notes, extra_evidence)
     evidence_count = len({e.id for n in notes for e in n.evidence}) + len(extra_evidence)
     lines = [
         f"# {title}",

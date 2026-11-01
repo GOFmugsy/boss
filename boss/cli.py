@@ -164,6 +164,7 @@ def cmd_list(args: argparse.Namespace) -> int:
     for note in notes:
         who = " ".join(f"@{m.handle}" for m in note.members) or "-"
         images = f" [{len(note.evidence)} evidence]" if note.evidence else ""
+        images += " [hidden]" if note.hidden else ""
         print(f"#{note.id:<5} {note.created:%Y-%m-%d %H:%M}  {KIND_LABELS[note.kind]:<14} {who:<20} {note.title}{images}")
     return 0
 
@@ -186,12 +187,17 @@ def cmd_export(args: argparse.Namespace) -> int:
             if e.id not in linked
         ]
     out = Path(args.output).expanduser() if args.output else None
-    text = notes_to_markdown(title, notes, out.parent.resolve() if out else None, extra_evidence=extra)
+    text = notes_to_markdown(
+        title, notes, out.parent.resolve() if out else None, extra_evidence=extra, include_hidden=args.include_hidden
+    )
+    hidden = 0 if args.include_hidden else sum(note.hidden for note in notes)
     if out:
         out.write_text(text)
-        print(f"Wrote {len(notes)} notes to {out}")
+        print(f"Wrote {len(notes) - hidden} notes to {out}")
     else:
         sys.stdout.write(text)
+    if hidden:
+        print(f"{hidden} note(s) tagged #hide left out (--include-hidden to include them)", file=sys.stderr)
     return 0
 
 
@@ -354,6 +360,9 @@ def build_parser() -> argparse.ArgumentParser:
     export.add_argument("-f", "--filter", help="text, #tag, @handle, kind:win")
     export.add_argument("--since", help="YYYY-MM-DD")
     export.add_argument("--until", help="YYYY-MM-DD (exclusive)")
+    export.add_argument(
+        "--include-hidden", action="store_true", help="include notes/evidence tagged #hide (e.g. for backups)"
+    )
     export.set_defaults(func=cmd_export)
 
     team = sub.add_parser("team", help="list or manage team members")
